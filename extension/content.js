@@ -29,6 +29,8 @@
   const FLIGHT_LOG_KEY = STORAGE_KEYS.FLIGHT_LOG;
   const AI_CACHE_KEY = STORAGE_KEYS.AI_CACHE;
   const PRICE_DB_KEY = STORAGE_KEYS.PRICE_DB;
+  const EXT_STORE_DB_KEY = STORAGE_KEYS.EXT_STORE_DB || 'lqs_ext_store_prices_v1';
+  const REJECTED_MATCHES_KEY = STORAGE_KEYS.REJECTED_MATCHES || 'lqs_rejected_matches_v1';
   const CART_LOCKS_KEY = STORAGE_KEYS.CART_LOCKS;
 
   const DEFAULT_SETTINGS = { ...globalThis.LQS_CONFIG.DEFAULT_SETTINGS };
@@ -439,6 +441,31 @@
         lines.push(`   - **Пинг серверов из Popup**: ${backendDiag}`);
       }
 
+      const compAuditLines = [];
+      if (dom.slug) {
+        const metaSnap = typeof extractProductPageMetadata === 'function' ? extractProductPageMetadata() : null;
+        const pIntelSnap = findPriceIntelInMemory(dom.slug, metaSnap?.title || '', metaSnap?.imageKey || null);
+        const offersSnap = Array.isArray(pIntelSnap?.competitorOffers) ? pIntelSnap.competitorOffers : [];
+        compAuditLines.push(
+          `- **Текущий товар**: "${metaSnap?.title || pIntelSnap?.title || dom.slug}" | Фасовка: "${metaSnap?.amountText || pIntelSnap?.amount || '—'}" | Цена Лавки: ${metaSnap?.price || pIntelSnap?.lastPrice || '—'} ₽`,
+          `- **Сопоставленных офферов сетей**: ${offersSnap.length} (Мин. цена конкурентов: ${pIntelSnap?.competitorMinPrice ? pIntelSnap.competitorMinPrice + ' ₽' : 'нет'})`
+        );
+        if (offersSnap.length > 0) {
+          offersSnap.slice(0, 12).forEach((o, idx) => {
+            const oldPart = o.oldPrice ? ` (старая ${o.oldPrice} ₽)` : '';
+            const originPart = o.origin === 'ddg' ? 'DDG' : (o.sourceRetailer ? `Купер/${o.sourceRetailer}` : (o.isVerifiedStoreOffer ? 'DOM/БД' : 'кэш'));
+            const updPart = o.updatedAt ? ` | ${String(o.updatedAt).slice(0, 19)}` : '';
+            compAuditLines.push(
+              `  ${idx + 1}. **${o.store || '?'}**: ${o.price || '?'} ₽${oldPart} [${originPart}] — "${String(o.title || '').slice(0, 90)}" | URL: ${o.url || '—'}${updPart}`
+            );
+          });
+        } else {
+          compAuditLines.push(`  - Совпадений по другим сетям для этого товара сейчас нет.`);
+        }
+      } else {
+        compAuditLines.push(`- Не страница товара (аудит конкурентов доступен на /good/<slug>).`);
+      }
+
       lines.push(
         ``,
         `## 3. АУДИТ DOM-СЕЛЕКТОРОВ ЯНДЕКС ЛАВКИ`,
@@ -452,6 +479,9 @@
         `- \`section[data-testid="traits-block"]\`: ${flag(s.traitsEl)}`,
         `- \`button[data-testid="snippet-control"]\`: ${flag(s.addBtnEl)}`,
         `- **Статус нашего виджета (.lqs-product-panel)**: ${s.panelMounted ? '✅ Смонтирован' : '⚪ Не смонтирован'} (Спойлер: ${s.drawerOpen ? 'ОТКРЫТ' : 'ЗАКРЫТ'})`,
+        ``,
+        `## 4. АУДИТ ЦЕН КОНКУРЕНТОВ И МАТЧЕРА (ТЕКУЩИЙ ТОВАР)`,
+        ...compAuditLines,
         ``,
         `## 5. СЧЁТЧИКИ ПРОИЗВОДИТЕЛЬНОСТИ И СТАБИЛЬНОСТИ DOM`,
         `- **SPA переходов**: ${c.spaTransitions} | **Маунтов панели**: ${c.panelMounts} | **Синхронизаций UI**: ${c.panelSyncs} | **Zero-Click ИИ-запусков**: ${c.autoAiRuns} | **Цен собрано**: ${c.pricesHarvested}`,
@@ -600,9 +630,6 @@
     el.dataset.lqsHtmlCache = nextHtml;
     el.innerHTML = nextHtml;
     LQS_RECORDER.counters.domWritesExecuted += 1;
-    if (tagKey) {
-      LQS_RECORDER.record('WIDGET', `DOM write executed for ${tagKey}`);
-    }
     return true;
   }
 
@@ -2548,11 +2575,21 @@
         }
         if (changes[PRICE_DB_KEY]) {
           priceDbMemory = changes[PRICE_DB_KEY].newValue || {};
+          // Сбрасываем кэш сводок в памяти вкладки, чтобы открытая карточка Лавки сразу получила свежие цены из других магазинов
+          priceSummaryBySlug.clear();
           renderProductPageWidget();
           decorateCatalogCards();
           if (window.location.pathname.includes('/cart')) {
             const snap = extractCartItemsFromDOM();
             if (snap.items.length > 0) renderCartAuditBanner(snap);
+          }
+        }
+        if (changes[EXT_STORE_DB_KEY] || changes[REJECTED_MATCHES_KEY]) {
+          const slug = extractSlugFromUrl(window.location.href);
+          if (slug) {
+            priceSummaryBySlug.delete(slug);
+            priceIntelRequestedSlugs.delete(slug);
+            renderProductPageWidget();
           }
         }
         if (changes[SETTINGS_KEY]) {

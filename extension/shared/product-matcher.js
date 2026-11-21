@@ -443,12 +443,17 @@
     // 7. ПРОВЕРКА ОБЪЁМА / ВЕСА (суженный допуск 0.88–1.14 для точного совпадения)
     const targetGrams = parseVolumeOrWeightGrams(productAmount) || parseVolumeOrWeightGrams(productTitle);
     const resGrams = parseVolumeOrWeightGrams(resTitle) || parseVolumeOrWeightGrams(resSnippet);
+    const requireVolume = Boolean(options && options.requireVolume);
     let isSameVolume = true;
+    let volumeMismatchReason = 'volume_mismatch';
     if (targetGrams && resGrams) {
       const ratio = resGrams / targetGrams;
       if (ratio < 0.88 || ratio > 1.14) {
         isSameVolume = false;
       }
+    } else if (requireVolume && targetGrams && !resGrams) {
+      isSameVolume = false;
+      volumeMismatchReason = 'volume_missing';
     }
 
     const candidatePrice = options && Number(options.candidatePrice) > 0 ? Number(options.candidatePrice) : null;
@@ -467,13 +472,13 @@
       return res;
     }
 
-    // Если отличается только вес/объём — isSameProduct: true, isSameVolume: false, matchQuality: 'similar'
+    // Если отличается только вес/объём (или вес не указан при requireVolume) — matchQuality: 'similar'
     if (!isSameVolume) {
       const res = {
         isSameProduct: true,
         isSameVolume: false,
         matchQuality: 'similar',
-        mismatchReason: 'volume_mismatch'
+        mismatchReason: volumeMismatchReason
       };
       if (candidatePricePerUnit) res.pricePerKgOrL = candidatePricePerUnit;
       return res;

@@ -65,20 +65,32 @@
     return m ? m[1].trim() : '';
   }
 
+  const NOISE_PRICE_PREFIX_RE = /(?:доставк[а-яё]*|кешбэк|кэшбэк|бонус[а-яё]*|спасибо|мин\.?\s*заказ[а-яё]*|бесплатн[а-яё]*|при\s+заказе\s+от|сборк[а-яё]*|сервисн[а-яё]*\s+сбор|пакет|от)\s*:?\s*$/i;
+  const NOISE_PRICE_ATTR_RE = /(delivery|shipping|cashback|bonus|spasibo|min[-_]?order|promo|banner|basket|cart[-_]?total|per[-_]?kg|unit[-_]?price)/i;
+  const RECOMMENDATION_CONTAINER_SELECTOR = '[data-qa*="recommendation" i], [data-testid*="recommendation" i], [class*="recommend" i], [class*="similar" i], [class*="carousel" i]';
+
   function extractPricePairFromText(text) {
     const clean = normalizeSpace(text);
     // Normalize Kuper ("144 ,00 ₽") and 5ka ("279 99 ₽") split-kopeck formats before matching
     const normalized = clean
       .replace(/(\d)\s+([.,]\d{1,2})\s*(?=(?:₽|рубл(?:ей|я|ь)|руб\.?))/gi, '$1$2 ')
       .replace(/(^|[^\d.,])(\d{1,5}(?:\s\d{3})?)\s+(\d{2})\s*(?=(?:₽|рубл(?:ей|я|ь)|руб\.?))/gi, '$1$2.$3 ');
-    // Avoid matching unit prices like "478 ₽/кг" or "120 ₽ за кг" when extracting main shelf price
-    const withoutUnit = normalized.replace(/\d+(?:[.,]\d{1,2})?\s*(?:₽|рубл(?:ей|я|ь)|руб\.?)\s*(?:\/\s*(?:кг|л|шт|100\s*г)|за\s*(?:кг|л|шт|100\s*г))/gi, ' ');
+    // Avoid matching unit prices like "478 ₽/кг", "25 ₽/100г", "120 ₽ за кг", "41 ₽ за 100 г"
+    const withoutUnit = normalized.replace(
+      /\d+(?:[.,]\d{1,2})?\s*(?:₽|рубл(?:ей|я|ь)|руб\.?)\s*(?:\/\s*(?:кг|л|шт|100\s*г(?:р)?|г)|за\s*(?:\d+\s*)?(?:кг|л|шт|г(?:р)?))/gi,
+      ' '
+    );
     const matchObjs = Array.from(withoutUnit.matchAll(/(\d{1,5}(?:\s?\d{3})?(?:[.,]\d{1,2})?)\s*(?:₽|рубл(?:ей|я|ь)|руб\.?)/gi))
       .map((m) => ({
         val: parseFloat(m[1].replace(/\s+/g, '').replace(',', '.')),
         idx: m.index || 0
       }))
-      .filter((o) => Number.isFinite(o.val) && o.val >= 10 && o.val <= 25000);
+      .filter((o) => {
+        if (!Number.isFinite(o.val) || o.val < 10 || o.val > 25000) return false;
+        const prefix = withoutUnit.slice(Math.max(0, o.idx - 28), o.idx);
+        if (NOISE_PRICE_PREFIX_RE.test(prefix)) return false;
+        return true;
+      });
 
     if (matchObjs.length === 0) return null;
     let first = matchObjs[0].val;
@@ -114,6 +126,50 @@
     }
     if (t.length > 140) t = t.slice(0, 140).trim();
     return t;
+  }
+
+  function extractPrimaryProductPrice(doc, mainText = '') {
+    if (doc && typeof doc.querySelectorAll === 'function') {
+      const priceSelectors = [
+        '[data-qa*="product_price" i]',
+        '[data-qa*="price" i]',
+        '[data-testid*="price" i]',
+        '[itemprop="price"]',
+        '[class*="ProductPrice" i]',
+        '[class*="product-price" i]',
+        '[class*="price-new" i]',
+        '[class*="current-price" i]'
+      ];
+      for (const sel of priceSelectors) {
+        let nodes = [];
+        try {
+          nodes = doc.querySelectorAll(sel);
+        } catch {
+          nodes = [];
+        }
+        for (let i = 0; i < Math.min(nodes.length, 12); i++) {
+          const el = nodes[i];
+          if (!el) continue;
+          const tag = String(el.tagName || '').toUpperCase();
+          if (tag === 'A' || tag === 'ARTICLE') continue;
+          if (typeof el.closest === 'function' && el.closest(RECOMMENDATION_CONTAINER_SELECTOR)) continue;
+          const attrHint = `${el.getAttribute?.('data-qa') || ''} ${el.getAttribute?.('data-testid') || ''} ${el.getAttribute?.('class') || ''}`;
+          if (NOISE_PRICE_ATTR_RE.test(attrHint)) continue;
+          const contentAttr = el.getAttribute?.('content');
+          if (contentAttr && /^\d+(?:[.,]\d{1,2})?$/.test(String(contentAttr).trim())) {
+            const v = parseFloat(String(contentAttr).replace(',', '.'));
+            if (Number.isFinite(v) && v >= 10 && v <= 25000) {
+              return { price: Math.round(v), oldPrice: null };
+            }
+          }
+          const txt = normalizeSpace(el.innerText || el.textContent || '');
+          if (!txt || txt.length > 160) continue;
+          const pr = extractPricePairFromText(txt);
+          if (pr) return pr;
+        }
+      }
+    }
+    return mainText ? extractPricePairFromText(mainText) : null;
   }
 
   function parseJsonLdOffers(doc, storeName, originHref) {
@@ -231,17 +287,18 @@
       const h1 = doc.querySelector('h1');
       const pageTitle = h1 ? normalizeSpace(h1.textContent || '') : doc.title.split('—')[0].trim();
       const mainScope = doc.querySelector('main') || doc.body;
-      const pr = extractPricePairFromText((mainScope?.innerText || '').slice(0, 2000));
+      const pr = extractPrimaryProductPrice(doc, (mainScope?.innerText || '').slice(0, 2000));
       if (pageTitle && pr && !seen.has(winLoc.href)) {
         const idMatch = winLoc.pathname.match(/\/product\/(\d+)/);
-        offers.push({
+        offers.unshift({
           store: 'Магнит',
           goodId: idMatch ? idMatch[1] : null,
           title: pageTitle,
           amount: extractWeightFromText(pageTitle),
           price: pr.price,
           oldPrice: pr.oldPrice,
-          url: winLoc.href
+          url: winLoc.href,
+          isPrimaryProductPage: true
         });
       }
     }
@@ -265,12 +322,22 @@
 
     // 1. Always harvest the currently open Kuper product page (/product/... or /products/...) first
     if (/\/products?\//i.test(winLoc.pathname || '')) {
+      const ldOffers = parseJsonLdOffers(doc, 'Купер', winLoc.href);
+      for (const o of ldOffers) {
+        o.sourceRetailer = pageSourceRetailer;
+        o.isPrimaryProductPage = true;
+        const dedupKey = `Купер|${pageSourceRetailer || ''}|${o.title.toLowerCase()}|${o.price}`;
+        if (!seen.has(dedupKey)) {
+          seen.add(dedupKey);
+          offers.push(o);
+        }
+      }
       const h1 = typeof doc.querySelector === 'function' ? doc.querySelector('h1') : null;
       const pageTitle = h1 ? normalizeSpace(h1.textContent || '') : '';
       const mainScope = (typeof doc.querySelector === 'function' ? doc.querySelector('main') : null) || doc.body;
       const mainText = String(mainScope?.innerText || mainScope?.textContent || '').slice(0, 2200);
-      const pr = extractPricePairFromText(mainText);
-      if (pageTitle && pageTitle.length >= 4 && pr) {
+      const pr = extractPrimaryProductPrice(doc, mainText);
+      if (offers.length === 0 && pageTitle && pageTitle.length >= 4 && pr) {
         const dedupKey = `Купер|${pageSourceRetailer || ''}|${pageTitle.toLowerCase()}|${pr.price}`;
         seen.add(dedupKey);
         offers.push({
@@ -281,17 +348,19 @@
           amount: extractWeightFromText(pageTitle) || extractWeightFromText(mainText.slice(0, 600)),
           price: pr.price,
           oldPrice: pr.oldPrice,
-          url: winLoc.href
+          url: winLoc.href,
+          isPrimaryProductPage: true
         });
       }
     }
 
-    // 2. Kuper multisearch & recommendations cards (both /products/ and web.kuper.ru /product/)
+    // 2. Kuper multisearch & recommendations cards (avoid broad [data-qa*="product"] that hits breadcrumbs/delivery/bonus blocks)
     const cardNodes = doc.querySelectorAll(
-      '[data-qa*="product"], [data-qa*="recommendations_product_card"], [data-qa*="products_grid_item"], [class*="ProductCard"], [class*="product-card"], article, a[href*="/products/"], a[href*="/product/"]'
+      '[data-qa*="product_card"], [data-qa*="product-card"], [data-qa*="recommendations_product_card"], [data-qa*="products_grid_item"], [class*="ProductCard"], [class*="product-card"], article, a[href*="/products/"], a[href*="/product/"]'
     );
 
     cardNodes.forEach((node) => {
+      if (node.querySelector?.('h1')) return;
       const card = node.tagName === 'A'
         ? (node.closest?.('article, [data-qa*="product"], [class*="ProductCard"], [class*="product-card"], li') || node.parentElement || node)
         : node;
@@ -377,7 +446,7 @@
       const pageTitle = h1 ? normalizeSpace(h1.textContent || '') : '';
       const mainScope = doc.querySelector('main') || doc.body;
       const mainText = String(mainScope?.innerText || mainScope?.textContent || '').slice(0, 2200);
-      const pr = extractPricePairFromText(mainText);
+      const pr = extractPrimaryProductPrice(doc, mainText);
       const brandEl = doc.querySelector('[itemprop="brand"], [data-testid*="brand"], [class*="Brand"]');
       const pageBrand = brandEl ? normalizeSpace(brandEl.getAttribute?.('content') || brandEl.textContent || '') : '';
       if (pageTitle && pageTitle.length >= 4 && pr) {
@@ -393,7 +462,8 @@
             amount: extractWeightFromText(pageTitle) || extractWeightFromText(mainText.slice(0, 600)),
             price: pr.price,
             oldPrice: pr.oldPrice,
-            url: winLoc.href
+            url: winLoc.href,
+            isPrimaryProductPage: true
           });
         }
       }

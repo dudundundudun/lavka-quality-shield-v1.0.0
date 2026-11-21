@@ -419,6 +419,7 @@ def is_search_result_matching_product(
     product_amount: Optional[str] = None,
     target_price: Optional[float] = None,
     candidate_price: Optional[float] = None,
+    require_volume: bool = False,
 ) -> ProductMatchResult:
     """
     Проверяет, относится ли найденный результат поиска ИМЕННО К ЭТОМУ ПРОДУКТУ.
@@ -534,10 +535,14 @@ def is_search_result_matching_product(
     res_grams = parse_volume_or_weight_grams(res_title) or parse_volume_or_weight_grams(res_snippet)
 
     is_same_volume = True
+    volume_mismatch_reason = "volume_mismatch"
     if target_grams and res_grams:
         ratio = res_grams / target_grams if target_grams > 0 else 1.0
         if ratio < 0.88 or ratio > 1.14:
             is_same_volume = False
+    elif require_volume and target_grams and not res_grams:
+        is_same_volume = False
+        volume_mismatch_reason = "volume_missing" 
 
     price_per_unit = compute_price_per_kg_or_liter(candidate_price, res_grams)
 
@@ -555,7 +560,7 @@ def is_search_result_matching_product(
             True,
             False,
             "similar",
-            "volume_mismatch",
+            volume_mismatch_reason,
             price_per_kg_or_l=price_per_unit,
         )
 

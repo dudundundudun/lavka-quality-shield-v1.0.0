@@ -1475,13 +1475,19 @@
 
     let lastRenderKey = '';
     let lastCheckedHref = '';
+    let lastRecordedOfferKey = '';
     let syncTimer = null;
+    let liveRefreshTimer = null;
+    let activeProductRef = null;
+    let activeStateRef = null;
+    let activeRerenderRef = null;
 
-    const syncWidget = () => {
+    const syncWidget = (forceRefreshComparisons = false) => {
       const storeInfo = detectAssistantStorePage(window.location);
       if (!storeInfo) {
         removeStoreAssistantWidget(document);
         lastRenderKey = '';
+        activeProductRef = null;
         return;
       }
 
@@ -1489,7 +1495,7 @@
       if (!product) return;
 
       const baseKey = `${window.location.href}|${product.title}|${product.price}|${product.amount}|${product.ingredients.length}`;
-      if (baseKey === lastRenderKey) return;
+      if (!forceRefreshComparisons && baseKey === lastRenderKey) return;
       lastRenderKey = baseKey;
 
       const state = {
@@ -1510,8 +1516,45 @@
         }
       };
 
+      activeProductRef = product;
+      activeStateRef = state;
+      activeRerenderRef = rerender;
+
       // Render immediately with local unit price + traffic light
       rerender();
+
+      // Автоматически сохраняем точную цену открытой карточки в общую базу (браузер + SQLite + Лавка)
+      const recordKey = `${product.store}|${product.url}|${product.title}|${product.price}|${product.oldPrice || ''}`;
+      if (
+        recordKey !== lastRecordedOfferKey &&
+        product.price > 0 &&
+        typeof chrome !== 'undefined' &&
+        chrome.runtime &&
+        typeof chrome.runtime.sendMessage === 'function'
+      ) {
+        lastRecordedOfferKey = recordKey;
+        chrome.runtime.sendMessage(
+          {
+            type: 'LQS_RECORD_EXTERNAL_STORE_OFFERS',
+            store: product.store,
+            offers: [
+              {
+                store: product.store,
+                title: product.title,
+                brand: product.brand || '',
+                amount: product.amount || '',
+                price: product.price,
+                oldPrice: product.oldPrice || null,
+                url: product.url,
+                isPrimaryProductPage: true
+              }
+            ]
+          },
+          () => {
+            void chrome.runtime?.lastError;
+          }
+        );
+      }
 
       // Load personal review from lqs_reviews_v1
       const initKey = buildStoreProductKey(product);
@@ -1579,6 +1622,114 @@
     }, 900);
 
     window.addEventListener('popstate', () => scheduleSync(350));
+
+    // Умный дебаггер на всех 7 внешних магазинах (LQS_GET_DIAGNOSTICS)
+    if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
+      chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+        if (!msg || msg.type !== 'LQS_GET_DIAGNOSTICS') return false;
+        const pageStore = detectAssistantStorePage(window.location);
+        const hostStore = ASSISTANT_STORES.find((s) => s.hostPattern.test(String(window.location.hostname || '').toLowerCase()));
+        const storeLabel = pageStore?.store || hostStore?.store || window.location.hostname;
+        const prod = activeProductRef || (pageStore ? extractStoreProductFromDoc(document, window.location, pageStore) : null);
+        const harvestSnap = root.LQS_STORE_HARVESTER && typeof root.LQS_STORE_HARVESTER.parseOffersFromDocument === 'function'
+          ? root.LQS_STORE_HARVESTER.parseOffersFromDocument(document, window.location)
+          : { offers: [], diagnostic: null };
+        const hostEl = document.getElementById(HOST_ID);
+        const mountMode = hostEl?.dataset?.lqsMountMode || (hostEl ? 'mounted' : 'not_mounted');
+        const cmp = activeStateRef?.comparisonData || null;
+        const lines = [
+          `# 🛠️ LAVKA QUALITY SHIELD v${root.LQS_CONFIG?.VERSION || '2.10.0'} — STORE DIAGNOSTIC LOG (${storeLabel})`,
+          `- **Timestamp**: ${new Date().toISOString()}`,
+          `- **URL**: ${window.location.href}`,
+          `- **Магазин**: ${storeLabel} | **Карточка товара**: ${pageStore ? '✅ ДА' : '⚪ Каталог/Поиск'} | **Виджет**: ${mountMode}`,
+          ``,
+          `## 1. ИЗВЛЕЧЁННЫЙ ТОВАР СО СТРАНИЦЫ`,
+          prod
+            ? `- **Название**: "${prod.title}" | **Бренд**: "${prod.brand || '—'}" | **Вес/объём**: "${prod.amount || '—'}" | **Цена**: ${prod.price} ₽${prod.oldPrice ? ` (старая ${prod.oldPrice} ₽)` : ''} | **Состав**: ${prod.ingredients ? prod.ingredients.length + ' симв.' : 'не найден'} | **Белок**: ${prod.proteinPer100g ?? '—'} г/100г`
+            : `- Товар не извлечён (не карточка товара или цена не найдена).`,
+          ``,
+          `## 2. СБОРЩИК ЦЕН (STORE HARVESTER)`,
+          `- **Найдено офферов на странице**: ${(harvestSnap.offers || []).length} | **Диагностика**: ${harvestSnap.diagnostic?.status || 'ok'} (${harvestSnap.diagnostic?.reason || 'ok'})`,
+          ...(harvestSnap.offers || []).slice(0, 6).map((o, i) => `  ${i + 1}. **${o.store}**${o.sourceRetailer ? ` (${o.sourceRetailer})` : ''}: ${o.price} ₽${o.oldPrice ? ` (старая ${o.oldPrice} ₽)` : ''} — "${String(o.title || '').slice(0, 80)}" [${o.amount || 'без веса'}] | ${o.url || ''}`),
+          ``,
+          `## 3. СРАВНЕНИЕ ЦЕН ИЗ БАЗЫ (LQS_COMPARE_STORE_PRODUCT)`,
+          cmp
+            ? [
+                `- **Яндекс Лавка**: ${cmp.lavka ? `${cmp.lavka.price} ₽ ("${cmp.lavka.title}")` : 'нет совпадения'}`,
+                `- **Точные совпадения в других сетях (${(cmp.otherStores || []).length})**: ${(cmp.otherStores || []).map((x) => `${x.store} ${x.price} ₽ ("${String(x.title || '').slice(0, 50)}")`).join('; ') || 'нет'}`,
+                `- **Похожие товары (${(cmp.similarStores || []).length})**: ${(cmp.similarStores || []).map((x) => `${x.store} ${x.price} ₽ [${x.mismatchReason || 'similar'}]`).join('; ') || 'нет'}`
+              ].join('\n')
+            : `- Сравнение ещё не загружено.`
+        ];
+        if (msg.backendDiag) {
+          lines.push(``, `- **Пинг серверов из Popup**: ${msg.backendDiag}`);
+        }
+        sendResponse({
+          ok: true,
+          reportText: lines.join('\n'),
+          modules: {
+            router: { status: 'OK', summary: `${storeLabel} (${pageStore ? 'PDP' : 'Catalog'})` },
+            parser: { status: prod ? 'OK' : 'IDLE', summary: prod ? `${prod.title.slice(0, 35)} (${prod.price} ₽)` : 'Не карточка товара' },
+            calculator: { status: prod ? 'OK' : 'IDLE', summary: prod ? `Вес: ${prod.amount || '—'}, белок: ${prod.proteinPer100g ?? '—'}` : 'Ожидание' },
+            widget: { status: hostEl ? 'OK' : 'IDLE', summary: `Режим: ${mountMode}` },
+            catalog: { status: 'OK', summary: `Собрано на странице: ${(harvestSnap.offers || []).length}` },
+            cartGuard: { status: 'IDLE', summary: 'Только на Лавке' },
+            storage: { status: 'OK', summary: 'Автосинхронизация активна' },
+            aiReviewer: { status: activeStateRef?.aiVerdict ? 'OK' : 'IDLE', summary: activeStateRef?.aiVerdict ? 'Вердикт загружен' : 'Готов' }
+          }
+        });
+        return true;
+      });
+    }
+
+    // Живое автообновление открытой вкладки магазина при изменении цен/отзывов в Лавке или других магазинах
+    const cfgKeys = (root.LQS_CONFIG && root.LQS_CONFIG.STORAGE_KEYS) || {};
+    const watchedKeys = new Set([
+      cfgKeys.PRICE_DB || 'lqs_price_db_v1',
+      cfgKeys.EXT_STORE_DB || 'lqs_ext_store_prices_v1',
+      cfgKeys.REJECTED_MATCHES || 'lqs_rejected_matches_v1',
+      REVIEWS_STORAGE_KEY
+    ]);
+    if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.onChanged) {
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area !== 'local' || !activeProductRef || !activeStateRef || !activeRerenderRef) return;
+        const touched = Object.keys(changes || {}).some((k) => watchedKeys.has(k));
+        if (!touched) return;
+        if (liveRefreshTimer) clearTimeout(liveRefreshTimer);
+        liveRefreshTimer = setTimeout(() => {
+          liveRefreshTimer = null;
+          if (!activeProductRef || !activeStateRef || !activeRerenderRef) return;
+          const prod = activeProductRef;
+          const st = activeStateRef;
+          const rerenderFn = activeRerenderRef;
+          if (changes[REVIEWS_STORAGE_KEY]) {
+            loadPersonalReview(buildStoreProductKey(prod, st.comparisonData?.lavka?.slug || ''), (rev) => {
+              st.review = rev || null;
+              rerenderFn();
+            });
+          }
+          if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
+            chrome.runtime.sendMessage(
+              {
+                type: 'LQS_COMPARE_STORE_PRODUCT',
+                payload: {
+                  store: prod.store,
+                  title: prod.title,
+                  brand: prod.brand,
+                  amount: prod.amount,
+                  price: prod.price
+                }
+              },
+              (resp) => {
+                if (chrome.runtime.lastError || !resp || !resp.ok) return;
+                st.comparisonData = resp;
+                rerenderFn();
+              }
+            );
+          }
+        }, 450);
+      });
+    }
 
     return true;
   }

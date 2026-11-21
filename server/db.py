@@ -1095,6 +1095,7 @@ def find_matching_external_store_offers(
     brand: str = "",
     amount: str = "",
     exclude_store: str = "",
+    target_price: Optional[float] = None,
     limit: int = 50,
 ) -> List[Dict[str, Any]]:
     clean_title = str(title or "").strip()
@@ -1186,6 +1187,9 @@ def find_matching_external_store_offers(
             row_amount or "",
             full_target_title,
             amount or "",
+            target_price=target_price,
+            candidate_price=row_price,
+            require_volume=True,
         )
         if not same_prod or not same_vol:
             continue

@@ -2478,5 +2478,66 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === 'LQS_GET_BG_DIAGNOSTICS') {
+    if (!isPopupSender(sender)) {
+      sendResponse({ ok: false, error: 'Forbidden' });
+      return true;
+    }
+    (async () => {
+      const [settings, priceDb, extOffers, radarStatus, rawExtra] = await Promise.all([
+        getSettings(),
+        getLocalPriceDb(),
+        getExternalStoreOffersList(),
+        getRadar16StoresStatus(),
+        new Promise((resolve) => {
+          chrome.storage.local.get(
+            [STORAGE_KEYS.REJECTED_MATCHES || 'lqs_rejected_matches_v1', STORAGE_KEYS.PRODUCT_LINKS || 'lqs_product_links_v1'],
+            (res) => resolve(res || {})
+          );
+        })
+      ]);
+      const liveExtOffers = extOffers.filter((o) => o && !o.isSeedFallback);
+      const extByStore = {};
+      for (const o of liveExtOffers) {
+        const st = o.store || 'Unknown';
+        extByStore[st] = (extByStore[st] || 0) + 1;
+      }
+      const rejectedMap = rawExtra[STORAGE_KEYS.REJECTED_MATCHES || 'lqs_rejected_matches_v1'] || {};
+      const linksMap = rawExtra[STORAGE_KEYS.PRODUCT_LINKS || 'lqs_product_links_v1'] || {};
+
+      let backendHealth = { online: false, statusText: 'OFFLINE (не отвечает)' };
+      const backendUrl = (settings.backendUrl || 'http://127.0.0.1:8765').replace(/\/$/, '');
+      try {
+        const r = await fetchWithTimeout(`${backendUrl}/api/health`, { method: 'GET' }, 1200);
+        if (r && r.ok) {
+          const j = await r.json();
+          backendHealth = {
+            online: true,
+            statusText: `ONLINE v${j.version || '?'} (schema v${j.schemaVersion || '?'})`
+          };
+        } else {
+          backendHealth = { online: false, statusText: `HTTP ${r?.status || 'ERR'}` };
+        }
+      } catch (err) {
+        backendHealth = { online: false, statusText: `OFFLINE (${err?.message || 'timeout'})` };
+      }
+
+      return {
+        ok: true,
+        localPriceDbCount: Object.keys(priceDb || {}).length,
+        localExtOffersCount: liveExtOffers.length,
+        seedOffersCount: extOffers.length - liveExtOffers.length,
+        extByStore,
+        rejectedProductsCount: Object.keys(rejectedMap || {}).length,
+        rememberedLinksProductsCount: Object.keys(linksMap || {}).length,
+        providers: radarStatus?.providers || [],
+        backendHealth
+      };
+    })()
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
   return false;
 });

@@ -46,7 +46,7 @@ test('DDG guard rejects "от 99 ₽" snippet without volume for Сливки 10
     '500 г'
   );
   assert.equal(res.competitorMinPrice, null);
-  assert.deepEqual(res.competitorOffers, []);
+  assert.equal(res.competitorOffers.length, 0);
 });
 
 test('DDG guard rejects "от 149 ₽" even when volume 500 г is present on product URL', () => {
@@ -64,7 +64,7 @@ test('DDG guard rejects "от 149 ₽" even when volume 500 г is present on pro
     '500 г'
   );
   assert.equal(res.competitorMinPrice, null);
-  assert.deepEqual(res.competitorOffers, []);
+  assert.equal(res.competitorOffers.length, 0);
 });
 
 test('DDG guard rejects snippet without volume when target product specifies 500 г', () => {
@@ -82,7 +82,7 @@ test('DDG guard rejects snippet without volume when target product specifies 500
     '500 г'
   );
   assert.equal(res.competitorMinPrice, null);
-  assert.deepEqual(res.competitorOffers, []);
+  assert.equal(res.competitorOffers.length, 0);
 });
 
 test('DDG guard rejects category/search/brand URLs even with matching volume and exact price', () => {
@@ -106,7 +106,7 @@ test('DDG guard rejects category/search/brand URLs even with matching volume and
     '500 г'
   );
   assert.equal(res.competitorMinPrice, null);
-  assert.deepEqual(res.competitorOffers, []);
+  assert.equal(res.competitorOffers.length, 0);
 });
 
 test('DDG guard accepts genuine product URL with exact volume and non-"от" price and tags origin=ddg', () => {

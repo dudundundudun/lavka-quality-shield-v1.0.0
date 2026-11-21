@@ -1011,11 +1011,14 @@ async function fetchBackendLogsTail() {
             resolve(['', '## 7. ЛОГ FASTAPI (:8765)', ...data.logs.slice(0, 25).map((l) => `${l.ts} [${l.level}] ${l.msg}`)].join('\n'));
             return;
           }
+          resolve(['', '## 7. ЛОГ FASTAPI (:8765)', '- Сервер ONLINE, событий пока нет.'].join('\n'));
+          return;
         }
+        resolve(['', '## 7. ЛОГ FASTAPI (:8765)', `- ⚠️ Сервер вернул HTTP ${r.status}`].join('\n'));
+        return;
       } catch {
-        // ignore
+        resolve(['', '## 7. ЛОГ FASTAPI (:8765)', '- ⚠️ Локальный сервер :8765 OFFLINE / не отвечает (работает только браузерный кэш chrome.storage.local)'].join('\n'));
       }
-      resolve('');
     });
   });
 }
@@ -1032,29 +1035,65 @@ function sanitizeDiagnosticsText(text, aiApiKey = '') {
   return out;
 }
 
+function formatBgDiagnosticsSection(bgDiag) {
+  if (!bgDiag || !bgDiag.ok) return '';
+  const storeBreakdown = Object.entries(bgDiag.extByStore || {})
+    .sort((a, b) => b[1] - a[1])
+    .map(([st, cnt]) => `${st}: ${cnt}`)
+    .join(', ') || 'пока пусто';
+  const provLine = (bgDiag.providers || [])
+    .map((p) => `${p.label}: ${p.status}${p.pausedMin ? ` (пауза ${p.pausedMin} мин)` : ''}${p.failures ? ` [ошибок: ${p.failures}]` : ''}`)
+    .join(' | ') || '—';
+  return [
+    '',
+    '## 6b. ТЕЛЕМЕТРИЯ SERVICE WORKER, БАЗЫ ЦЕН И CIRCUIT BREAKER',
+    `- **Локальный сервер :8765**: ${bgDiag.backendHealth?.statusText || 'неизвестно'}`,
+    `- **Браузерная база**: ${bgDiag.localPriceDbCount} товаров Лавки | ${bgDiag.localExtOffersCount} живых офферов сетей (+${bgDiag.seedOffersCount} seed) | ${bgDiag.rememberedLinksProductsCount} прямых ссылок | ${bgDiag.rejectedProductsCount} товаров с отклонёнными матчами`,
+    `- **Офферы по магазинам**: ${storeBreakdown}`,
+    `- **Провайдеры радара**: ${provLine}`
+  ].join('\n');
+}
+
+function isSupportedDiagnosticTabUrl(url) {
+  return /(?:lavka\.yandex\.ru|kuper\.ru|magnit\.ru|perekrestok\.ru|vprok\.ru|5ka\.ru|vkusvill\.ru|auchan\.ru|lenta\.com)/i.test(String(url || ''));
+}
+
+async function fetchBgDiagnosticsSummary() {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: 'LQS_GET_BG_DIAGNOSTICS' }, (resp) => {
+      if (chrome.runtime.lastError || !resp || !resp.ok) {
+        resolve('');
+        return;
+      }
+      resolve(formatBgDiagnosticsSection(resp));
+    });
+  });
+}
+
 async function refreshDiagnosticsView() {
   const box = document.getElementById('diag-report-box');
   box.textContent = 'Собираю бортовой журнал...';
-  const backendTail = await fetchBackendLogsTail();
+  const [backendTail, bgSection] = await Promise.all([fetchBackendLogsTail(), fetchBgDiagnosticsSummary()]);
+  const fullTail = bgSection + backendTail;
   const currentAiKey = (document.getElementById('inp-ai-key')?.value || '').trim();
 
   return new Promise((resolve) => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const activeTab = tabs && tabs[0];
-      if (activeTab && activeTab.id && activeTab.url && activeTab.url.includes('lavka.yandex.ru')) {
+      if (activeTab && activeTab.id && isSupportedDiagnosticTabUrl(activeTab.url)) {
         chrome.tabs.sendMessage(
           activeTab.id,
           { type: 'LQS_GET_DIAGNOSTICS', backendDiag: lastBackendPingSummary },
           (resp) => {
             if (!chrome.runtime.lastError && resp && resp.reportText) {
               renderModulePills(resp.modules);
-              box.textContent = sanitizeDiagnosticsText(resp.reportText + backendTail, currentAiKey);
+              box.textContent = sanitizeDiagnosticsText(resp.reportText + fullTail, currentAiKey);
               resolve(box.textContent);
               return;
             }
             chrome.storage.local.get([FLIGHT_LOG_KEY], (res) => {
               const snap = res && res[FLIGHT_LOG_KEY];
-              const raw = (snap && snap.reportText ? snap.reportText : 'Нажми F5 на вкладке Лавки') + backendTail;
+              const raw = (snap && snap.reportText ? snap.reportText : 'Нажми F5 на вкладке Лавки или магазина') + fullTail;
               box.textContent = sanitizeDiagnosticsText(raw, currentAiKey);
               resolve(box.textContent);
             });
@@ -1063,7 +1102,7 @@ async function refreshDiagnosticsView() {
       } else {
         chrome.storage.local.get([FLIGHT_LOG_KEY], (res) => {
           const snap = res && res[FLIGHT_LOG_KEY];
-          const raw = (snap && snap.reportText ? snap.reportText : 'Открой вкладку Лавки') + backendTail;
+          const raw = (snap && snap.reportText ? snap.reportText : 'Открой вкладку Лавки или любого из 7 магазинов') + fullTail;
           box.textContent = sanitizeDiagnosticsText(raw, currentAiKey);
           resolve(box.textContent);
         });

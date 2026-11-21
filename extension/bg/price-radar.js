@@ -221,12 +221,19 @@
     return null;
   }
 
-  function sanitizeCompetitorOffersForProduct(offers, productTitle, productAmount = '') {
+  function sanitizeCompetitorOffersForProduct(offers, productTitle, productAmount = '', targetPrice = null) {
     if (!Array.isArray(offers) || offers.length === 0) return [];
     if (!productTitle) return offers;
+    const tPrice = Number(targetPrice) > 0 ? Number(targetPrice) : null;
     return offers.filter((o) => {
       if (!o) return false;
-      const check = isSearchResultMatchingProduct(o.title || '', '', productTitle, productAmount);
+      const cPrice = Number(o.price) > 0 ? Number(o.price) : null;
+      const opts = { requireVolume: true };
+      if (tPrice && cPrice) {
+        opts.targetPrice = tPrice;
+        opts.candidatePrice = cPrice;
+      }
+      const check = isSearchResultMatchingProduct(o.title || '', o.amount || '', productTitle, productAmount, opts);
       return check.isSameProduct && check.isSameVolume;
     });
   }
@@ -263,7 +270,7 @@
       Array.isArray(item.competitorOffers) && item.competitorOffers.length > 0
         ? item.competitorOffers
         : (Array.isArray(existing?.competitorOffers) ? existing.competitorOffers : []);
-    const compOffers = sanitizeCompetitorOffersForProduct(rawOffers, effectiveTitle, effectiveAmount);
+    const compOffers = sanitizeCompetitorOffersForProduct(rawOffers, effectiveTitle, effectiveAmount, price || existing?.lastPrice || null);
 
     let compMin = item.competitorMinPrice ? Number(item.competitorMinPrice) : null;
     let compSum = item.competitorSummary || null;
@@ -663,32 +670,35 @@
       const authoritativeTitle = summary.title || fullCardTitle || '';
       const authoritativeAmount = summary.amount || amount || '';
       const authoritativeBrand = summary.brand || brand || '';
+      const effectiveTargetPrice = (Number(currentPrice) > 0 ? Number(currentPrice) : (Number(summary.lastPrice) > 0 ? Number(summary.lastPrice) : null));
       const [extList, backendMatchedExt] = await Promise.all([
         getExternalStoreOffersList(),
         fetchExternalOffersMatchFromBackend({
           title: authoritativeTitle,
           brand: authoritativeBrand,
           amount: authoritativeAmount,
-          excludeStore: 'Яндекс Лавка'
+          excludeStore: 'Яндекс Лавка',
+          targetPrice: effectiveTargetPrice
         })
       ]);
-      const localMatchedExt = findMatchingExternalStoreOffersFromList(extList, authoritativeTitle, authoritativeAmount);
+      const localMatchedExt = findMatchingExternalStoreOffersFromList(extList, authoritativeTitle, authoritativeAmount, effectiveTargetPrice);
       const matchedExt = mergeUniqueStoreOffers(localMatchedExt, backendMatchedExt);
 
       let combinedOffers = mergeUniqueStoreOffers(summary.competitorOffers || [], matchedExt);
       combinedOffers = sanitizeCompetitorOffersForProduct(
         combinedOffers,
         authoritativeTitle,
-        authoritativeAmount
+        authoritativeAmount,
+        effectiveTargetPrice
       );
 
       // Если в базе ещё нет цен других магазинов для этого товара, запускаем прямой экспресс-парсинг ВкусВилла и мульти-поиска сетей
       if (combinedOffers.filter((o) => o.price && o.price > 0).length < 2 && authoritativeTitle) {
         try {
-          const directStoreOffers = await getBgDeps().probeDirectRetailStoresForProduct(authoritativeTitle, authoritativeBrand, authoritativeAmount, currentPrice);
+          const directStoreOffers = await getBgDeps().probeDirectRetailStoresForProduct(authoritativeTitle, authoritativeBrand, authoritativeAmount, effectiveTargetPrice);
           if (directStoreOffers.length > 0) {
             combinedOffers = mergeUniqueStoreOffers(combinedOffers, directStoreOffers);
-            combinedOffers = sanitizeCompetitorOffersForProduct(combinedOffers, authoritativeTitle, authoritativeAmount);
+            combinedOffers = sanitizeCompetitorOffersForProduct(combinedOffers, authoritativeTitle, authoritativeAmount, effectiveTargetPrice);
           }
         } catch (err) {
           console.warn('[LQS PriceRadar] Direct retail stores probe failed:', authoritativeTitle, err?.message || err);
@@ -703,6 +713,9 @@
       if (priced.length > 0) {
         summary.competitorMinPrice = Math.min(...priced.map((o) => o.price));
         summary.competitorSummary = priced.slice(0, 4).map((o) => `${o.store}: ${o.price} ₽`).join(', ');
+      } else {
+        summary.competitorMinPrice = null;
+        summary.competitorSummary = null;
       }
       summary.storeSearchLinks = buildDirectStoreSearchLinks(
         authoritativeTitle,
@@ -912,7 +925,7 @@
     return null;
   }
 
-  async function fetchExternalOffersMatchFromBackend({ title = '', brand = '', amount = '', excludeStore = '' } = {}) {
+  async function fetchExternalOffersMatchFromBackend({ title = '', brand = '', amount = '', excludeStore = '', targetPrice = null } = {}) {
     const cleanTitle = String(title || '').trim();
     if (!cleanTitle || cleanTitle.length < 3) return [];
     if (Date.now() <= (getBgDeps().getBackendOfflineUntilTs?.() || 0)) return [];
@@ -921,17 +934,21 @@
       const settings = await getSettings();
       const backendUrl = (settings.backendUrl || '').replace(/\/$/, '');
       if (!backendUrl) return [];
+      const bodyPayload = {
+        title: cleanTitle,
+        brand: String(brand || '').trim(),
+        amount: String(amount || '').trim(),
+        excludeStore: String(excludeStore || '').trim()
+      };
+      if (Number(targetPrice) > 0) {
+        bodyPayload.targetPrice = Number(targetPrice);
+      }
       const resp = await fetchWithTimeout(
         `${backendUrl}/api/external-offers/match`,
         {
           method: 'POST',
           headers: await getBgDeps().getBackendAuthHeaders(backendUrl, { 'Content-Type': 'application/json' }),
-          body: JSON.stringify({
-            title: cleanTitle,
-            brand: String(brand || '').trim(),
-            amount: String(amount || '').trim(),
-            excludeStore: String(excludeStore || '').trim()
-          })
+          body: JSON.stringify(bodyPayload)
         },
         1500
       );
@@ -992,15 +1009,18 @@
     let dbChanged = false;
     for (const entry of Object.values(priceDb)) {
       if (!entry || !entry.title) continue;
-      const matchedOffers = findMatchingExternalStoreOffersFromList(finalArr, entry.title, entry.amount || '');
-      if (matchedOffers.length > 0) {
-        const mergedOffers = mergeUniqueStoreOffers(entry.competitorOffers || [], matchedOffers);
-        entry.competitorOffers = sanitizeCompetitorOffersForProduct(mergedOffers, entry.title, entry.amount || '');
-        const priced = entry.competitorOffers.filter((o) => o.price && o.price > 0);
-        if (priced.length > 0) {
-          entry.competitorMinPrice = Math.min(...priced.map((o) => o.price));
-          entry.competitorSummary = priced.slice(0, 4).map((o) => `${o.store}: ${o.price} ₽`).join(', ');
-        }
+      const entryTargetPrice = Number(entry.lastPrice) > 0 ? Number(entry.lastPrice) : null;
+      const matchedOffers = findMatchingExternalStoreOffersFromList(finalArr, entry.title, entry.amount || '', entryTargetPrice);
+      const prevJson = JSON.stringify(entry.competitorOffers || []);
+      const mergedOffers = mergeUniqueStoreOffers(entry.competitorOffers || [], matchedOffers);
+      const sanitizedOffers = sanitizeCompetitorOffersForProduct(mergedOffers, entry.title, entry.amount || '', entryTargetPrice);
+      if (JSON.stringify(sanitizedOffers) !== prevJson) {
+        entry.competitorOffers = sanitizedOffers;
+        const priced = sanitizedOffers.filter((o) => o.price && o.price > 0);
+        entry.competitorMinPrice = priced.length > 0 ? Math.min(...priced.map((o) => o.price)) : null;
+        entry.competitorSummary = priced.length > 0
+          ? priced.slice(0, 4).map((o) => `${o.store}: ${o.price} ₽`).join(', ')
+          : null;
         dbChanged = true;
       }
     }
@@ -1018,12 +1038,19 @@
     };
   }
 
-  function findMatchingExternalStoreOffersFromList(extList, productTitle, productAmount = '') {
+  function findMatchingExternalStoreOffersFromList(extList, productTitle, productAmount = '', targetPrice = null) {
     if (!productTitle || !Array.isArray(extList)) return [];
+    const tPrice = Number(targetPrice) > 0 ? Number(targetPrice) : null;
     const matches = [];
     for (const ext of extList) {
       if (!ext || !ext.title || !ext.price) continue;
-      const check = isSearchResultMatchingProduct(ext.title, ext.amount || '', productTitle, productAmount);
+      const cPrice = Number(ext.price) > 0 ? Number(ext.price) : null;
+      const opts = { requireVolume: true };
+      if (tPrice && cPrice) {
+        opts.targetPrice = tPrice;
+        opts.candidatePrice = cPrice;
+      }
+      const check = isSearchResultMatchingProduct(ext.title, ext.amount || '', productTitle, productAmount, opts);
       if (check.isSameProduct && check.isSameVolume) {
         matches.push({
           store: ext.store || 'Магнит',
@@ -1032,6 +1059,8 @@
           oldPrice: ext.oldPrice ? Math.round(Number(ext.oldPrice)) : null,
           url: ext.url,
           title: ext.title,
+          amount: ext.amount || '',
+          updatedAt: ext.updatedAt || null,
           isVerifiedStoreOffer: true
         });
       }
@@ -1040,15 +1069,22 @@
   }
 
   function mergeUniqueStoreOffers(existingOffers = [], newOffers = []) {
-    const map = new Map();
+    const seenByUrl = new Set();
+    const seenByStorePrice = new Set();
+    const arr = Array.from([]);
+    // Новые офферы идут первыми: свежая цена по тому же store|url всегда заменяет устаревшую
     for (const o of [...newOffers, ...existingOffers]) {
       if (!o || !o.store) continue;
-      const key = `${o.store}|${o.price || 'noprice'}`;
-      if (!map.has(key)) {
-        map.set(key, o);
-      }
+      const cleanUrl = cleanOfferUrlForKey(o.url);
+      const isSearchUrl = Boolean(cleanUrl && /(?:\/search|\/multisearch|\?(?:q|term|search)=)/i.test(cleanUrl));
+      const urlKey = cleanUrl && !isSearchUrl ? `${o.store}|${cleanUrl}` : '';
+      const priceKey = `${o.store}|${o.price || 'noprice'}`;
+      if (urlKey && seenByUrl.has(urlKey)) continue;
+      if (seenByStorePrice.has(priceKey)) continue;
+      if (urlKey) seenByUrl.add(urlKey);
+      seenByStorePrice.add(priceKey);
+      arr.push(o);
     }
-    const arr = Array.from(map.values());
     arr.sort((a, b) => {
       if (a.price && b.price) return a.price - b.price;
       if (a.price) return -1;
@@ -1128,11 +1164,12 @@
         const aiEntry = await getBgDeps().getLocalAiCacheEntry(slug, fullAuthoritativeTitle, cardImageKey);
 
         const extStoreList = await getExternalStoreOffersList();
-        const matchedExtOffers = findMatchingExternalStoreOffersFromList(extStoreList, fullAuthoritativeTitle, cardAmount);
+        const matchedExtOffers = findMatchingExternalStoreOffersFromList(extStoreList, fullAuthoritativeTitle, cardAmount, price || null);
         let compOffers = sanitizeCompetitorOffersForProduct(
           mergeUniqueStoreOffers(pEntry?.competitorOffers || [], matchedExtOffers),
           fullAuthoritativeTitle,
-          cardAmount
+          cardAmount,
+          price || null
         );
         let compMin = null;
         let compSum = '';
@@ -2080,7 +2117,12 @@
             const matchingDirect = r.offers
               .filter((o) => o && o.price > 0 && isDirectProductUrl(o.url, r.storeId))
               .filter((o) => {
-                const chk = isSearchResultMatchingProduct(o.title || '', o.amount || '', title, amount);
+                const opts = { requireVolume: true };
+                if (price && o.price > 0) {
+                  opts.targetPrice = price;
+                  opts.candidatePrice = o.price;
+                }
+                const chk = isSearchResultMatchingProduct(o.title || '', o.amount || '', title, amount, opts);
                 return chk.isSameProduct && chk.isSameVolume;
               })
               .sort((a, b) => a.price - b.price);
@@ -2171,6 +2213,7 @@
       return { ok: true, lavka: null, otherStores: [] };
     }
 
+    const numTargetPrice = Number.isFinite(Number(price)) && Number(price) > 0 ? Number(price) : null;
     const [priceDb, extList, backendMatchedExt] = await Promise.all([
       getLocalPriceDb(),
       getExternalStoreOffersList(),
@@ -2178,7 +2221,8 @@
         title: cleanTitle,
         brand: brand || '',
         amount: amount || '',
-        excludeStore: store || ''
+        excludeStore: store || '',
+        targetPrice: numTargetPrice
       })
     ]);
 
@@ -2188,7 +2232,12 @@
       if (!entry || !entry.title) continue;
       const candidatePrice = Number(entry.lastPrice || entry.minPrice || 0);
       if (!Number.isFinite(candidatePrice) || candidatePrice <= 0) continue;
-      const check = isSearchResultMatchingProduct(entry.title, entry.amount || '', cleanTitle, amount || '');
+      const lavkaMatchOpts = { requireVolume: true };
+      if (numTargetPrice) {
+        lavkaMatchOpts.targetPrice = numTargetPrice;
+        lavkaMatchOpts.candidatePrice = candidatePrice;
+      }
+      const check = isSearchResultMatchingProduct(entry.title, entry.amount || '', cleanTitle, amount || '', lavkaMatchOpts);
       if (check.isSameProduct && check.isSameVolume) {
         if (!bestLavka || candidatePrice < bestLavka.price) {
           const slug = String(entry.slug || '').trim();
@@ -2245,7 +2294,7 @@
 
     // 2. Find matching external store offers (excluding current store), combining local cache + SQLite + filtering rejected
     const rejectedSet = await getRejectedMatchesForProduct(cleanTitle);
-    const localMatchedExt = findMatchingExternalStoreOffersFromList(extList, cleanTitle, amount || '');
+    const localMatchedExt = findMatchingExternalStoreOffersFromList(extList, cleanTitle, amount || '', numTargetPrice);
     const matchedExt = filterRejectedOffers(mergeUniqueStoreOffers(localMatchedExt, backendMatchedExt), rejectedSet);
     const bestByStore = new Map();
     for (const offer of matchedExt) {

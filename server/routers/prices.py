@@ -376,6 +376,7 @@ class ExternalOffersMatchRequest(BaseModel):
     brand: Optional[str] = ""
     amount: Optional[str] = ""
     excludeStore: Optional[str] = ""
+    targetPrice: Optional[float] = None
     limit: int = Field(50, ge=1, le=200)
 
 
@@ -408,6 +409,7 @@ def match_external_offers_endpoint(req: ExternalOffersMatchRequest):
             brand=req.brand or "",
             amount=req.amount or "",
             exclude_store=req.excludeStore or "",
+            target_price=req.targetPrice,
             limit=req.limit,
         )
         total = db.count_external_store_offers(conn)
